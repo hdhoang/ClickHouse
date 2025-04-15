@@ -3,11 +3,10 @@ import os
 import time
 from pathlib import Path
 
-from praktika.result import Result
-from praktika.utils import MetaClasses, Shell, Utils
-
 from ci.jobs.scripts.clickhouse_proc import ClickHouseProc
 from ci.jobs.scripts.functional_tests_results import FTResultsProcessor
+from ci.praktika.result import Result
+from ci.praktika.utils import MetaClasses, Shell, Utils
 
 temp_dir = f"{Utils.cwd()}/ci/tmp/"
 
@@ -22,7 +21,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="ClickHouse Build Job")
     parser.add_argument("--ch-path", help="Path to clickhouse binary", default=temp_dir)
     parser.add_argument(
-        "--test-options",
+        "--options",
         help="Comma separated option(s): parallel|non-parallel|BATCH_NUM/BTATCH_TOT|..",
         default="",
     )
@@ -51,25 +50,38 @@ def run_stateless_test(
     Shell.run(statless_test_command, verbose=True)
 
 
-def main():
+OPTIONS_TO_INSTALL_ARGUMENTS = {
+    "old analyzer": "--analyzer",
+    "s3 storage": "--s3-storage",
+    "DatabaseReplicated": "--db-replicated",
+    "DatabaseOrdinary": "--db-ordinary",
+    "wide parts enabled": "--wide-parts",
+    "ParallelReplicas": "--parallel-rep",
+    "distributed plan": "--distributed-plan",
+    "azure": "--azure",
+}
 
+
+def main():
     args = parse_args()
-    test_options = args.test_options.split(",")
+    test_options = args.options.split(",")
     no_parallel = "non-parallel" in test_options
     no_sequential = "parallel" in test_options
     batch_num, total_batches = 0, 0
+    config_installs_args = ""
     for to in test_options:
         if "/" in to:
             batch_num, total_batches = map(int, to.split("/"))
+        if to in OPTIONS_TO_INSTALL_ARGUMENTS:
+            print(f"NOTE: Enabled config option [{OPTIONS_TO_INSTALL_ARGUMENTS[to]}]")
+            config_installs_args += f" {OPTIONS_TO_INSTALL_ARGUMENTS[to]}"
 
-    # TODO: find a way to work with Azure secret so it's ok for local tests as well, for now keep azure disabled
-    os.environ["AZURE_CONNECTION_STRING"] = Shell.get_output(
-        f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
-        verbose=True,
-    )
-    no_azure = False
-    if not os.environ["AZURE_CONNECTION_STRING"]:
-        no_azure = True
+    if "azure" in test_options:
+        # TODO: find a way to work with Azure secret so it's ok for local tests as well, for now keep azure disabled
+        os.environ["AZURE_CONNECTION_STRING"] = Shell.get_output(
+            f"aws ssm get-parameter --region us-east-1 --name azure_connection_string --with-decryption --output text --query Parameter.Value",
+            verbose=True,
+        )
 
     ch_path = args.ch_path
     assert (
@@ -109,9 +121,9 @@ def main():
             f"ln -sf {ch_path}/clickhouse {ch_path}/clickhouse-format",
             f"rm -rf {temp_dir}/etc/ && mkdir -p {temp_dir}/etc/clickhouse-client {temp_dir}/etc/clickhouse-server",
             f"cp programs/server/config.xml programs/server/users.xml {temp_dir}/etc/clickhouse-server/",
-            f"./tests/config/install.sh {temp_dir}/etc/clickhouse-server {temp_dir}/etc/clickhouse-client --s3-storage {'--no-azure' if no_azure else ''}",
+            f"./tests/config/install.sh {temp_dir}/etc/clickhouse-server {temp_dir}/etc/clickhouse-client {config_installs_args}",
             # clickhouse benchmark segfaults with --config-path, so provide client config by its default location
-            f"cp {temp_dir}/etc/clickhouse-client/* /etc/clickhouse-client/",
+            f"mkdir -p /etc/clickhouse-client && cp {temp_dir}/etc/clickhouse-client/* /etc/clickhouse-client/",
             # update_path_ch_config,
             # f"sed -i 's|>/var/|>{temp_dir}/var/|g; s|>/etc/|>{temp_dir}/etc/|g' {temp_dir}/etc/clickhouse-server/config.xml",
             # f"sed -i 's|>/etc/|>{temp_dir}/etc/|g' {temp_dir}/etc/clickhouse-server/config.d/ssl_certs.xml",
@@ -131,7 +143,11 @@ def main():
         step_name = "Start ClickHouse Server"
         print(step_name)
         minio_log = f"{temp_dir}/minio.log"
-        res = res and CH.start_minio(test_type="stateless", log_file_path=minio_log)
+        res = (
+            res
+            and CH.start_minio(test_type="stateless", log_file_path=minio_log)
+            and CH.start_azurite()
+        )
         logs_to_attach += [minio_log]
         time.sleep(10)
         Shell.check("ps -ef | grep minio", verbose=True)
